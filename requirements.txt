@@ -1,7 +1,8 @@
 argparse==1.4.0
-openai==0.27.4
+openai
 chromadb==0.4.6
 pre-commit>=3.2.0
 python-dotenv==1.0.0
 tiktoken==0.3.3
-llama-cpp-python>=0.1.42
+# llama-cpp-python>=0.1.42
+azure-identity

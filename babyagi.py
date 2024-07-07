@@ -11,24 +11,46 @@ from collections import deque
 from typing import Dict, List
 import importlib
 import openai
-import chromadb
+from openai import AzureOpenAI
+import pysqlite3
+import sys
 import tiktoken as tiktoken
+import re
+
+# Remap sqlite3 to pysqlite3
+sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+# IMPORTANT, import chrome after sqlite3 remap
+import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
-import re
 
 # default opt out of chromadb telemetry.
 from chromadb.config import Settings
 
 client = chromadb.Client(Settings(anonymized_telemetry=False))
 
-# Engine configuration
+# Configure OpenAI
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+deployment = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"]
+
+openai.api_type = "azure"
+openai.api_key = api_key
+openai.api_base = endpoint
+openai.api_version = api_version
+
+azure_client = AzureOpenAI(
+    api_key = api_key,  
+    azure_endpoint=endpoint,
+    api_version=api_version,
+)
 
 # Model: GPT, LLAMA, HUMAN, etc.
-LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")).lower()
+LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_API_MODEL", "gpt-35-turbo")).lower()
 
 # API Keys
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
 if not (LLM_MODEL.startswith("llama") or LLM_MODEL.startswith("human")):
     assert OPENAI_API_KEY, "\033[91m\033[1m" + "OPENAI_API_KEY environment variable is missing from .env" + "\033[0m\033[0m"
 
@@ -168,9 +190,6 @@ if not JOIN_EXISTING_OBJECTIVE:
 else:
     print("\033[93m\033[1m" + f"\nJoining to help the objective" + "\033[0m\033[0m")
 
-# Configure OpenAI
-openai.api_key = OPENAI_API_KEY
-
 
 # Llama embedding function
 class LlamaEmbeddingFunction(EmbeddingFunction):
@@ -184,6 +203,22 @@ class LlamaEmbeddingFunction(EmbeddingFunction):
             e = llm_embed.embed(t)
             embeddings.append(e)
         return embeddings
+
+# Define the embedding generation function
+def generate_embeddings(text, model="text-embedding-ada-002"):  # model = "deployment_name"
+    response = azure_client.embeddings.create(input=[text], model=model)
+    return response.data[0].embedding
+
+# Define a class for embedding function using Azure OpenAI
+class AzureOpenAIEmbeddingFunction:
+    def __init__(self, embedding_function):
+        self.embedding_function = embedding_function
+
+    def __call__(self, input):
+        return [self.embedding_function(text) for text in input]
+
+# Initialize the embedding function with the generate_embeddings function
+
 
 
 # Results storage using local ChromaDB
@@ -202,7 +237,8 @@ class DefaultResultsStorage:
         if LLM_MODEL.startswith("llama"):
             embedding_function = LlamaEmbeddingFunction()
         else:
-            embedding_function = OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY)
+            # embedding_function = OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY)
+            embedding_function = AzureOpenAIEmbeddingFunction(embedding_function=generate_embeddings)
         self.collection = chroma_client.get_or_create_collection(
             name=RESULTS_STORE_NAME,
             metadata={"hnsw:space": metric},
@@ -356,7 +392,7 @@ def openai_call(
             elif not model.lower().startswith("gpt-"):
                 # Use completion API
                 response = openai.Completion.create(
-                    engine=model,
+                    engine=deployment,
                     prompt=prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -373,7 +409,7 @@ def openai_call(
 
                 # Use chat completion API
                 messages = [{"role": "system", "content": trimmed_prompt}]
-                response = openai.ChatCompletion.create(
+                response = azure_client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=temperature,
@@ -382,36 +418,11 @@ def openai_call(
                     stop=None,
                 )
                 return response.choices[0].message.content.strip()
-        except openai.error.RateLimitError:
-            print(
-                "   *** The OpenAI API rate limit has been exceeded. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.Timeout:
-            print(
-                "   *** OpenAI API timeout occurred. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.APIError:
-            print(
-                "   *** OpenAI API error occurred. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.APIConnectionError:
-            print(
-                "   *** OpenAI API connection error occurred. Check your network settings, proxy configuration, SSL certificates, or firewall rules. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.InvalidRequestError:
-            print(
-                "   *** OpenAI API invalid request. Check the documentation for the specific API method you are calling and make sure you are sending valid and complete parameters. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        except openai.error.ServiceUnavailableError:
-            print(
-                "   *** OpenAI API service unavailable. Waiting 10 seconds and trying again. ***"
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
+        except Exception as e:
+            print(f"OpenAI error occurred: {e}")
+            # Handle the error or re-raise it
+            time.sleep(10)
+
         else:
             break
 
